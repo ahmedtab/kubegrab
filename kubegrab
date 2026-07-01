@@ -81,13 +81,13 @@ gen_uuid() {
 
 # Read a prompt from /dev/tty so it works even when stdin is a pipe.
 read_tty() {
-  local prompt="$1" __var="$2" value=""
+  local prompt="$1" __var="$2" __rt_value=""
   if [ -r /dev/tty ]; then
-    read -r -p "$prompt" value < /dev/tty
+    read -r -p "$prompt" __rt_value < /dev/tty
   else
-    read -r -p "$prompt" value
+    read -r -p "$prompt" __rt_value
   fi
-  printf -v "$__var" '%s' "$value"
+  printf -v "$__var" '%s' "$__rt_value"
 }
 
 ask_with_default() {
