@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 kubegrab contributors
+# https://github.com/ahmedtab/kubegrab
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat << 'EOF'
+kubegrab — Import a remote kubeconfig into ~/.kube/config
+
+Usage:
+  kubegrab [FLAGS] [SOURCE] [CLUSTER_NAME] [CLUSTER_USER] [SERVER_URL] [INSECURE]
+  cat ./config.yaml | kubegrab [FLAGS] [-] [CLUSTER_NAME] [CLUSTER_USER] [SERVER_URL] [INSECURE]
+  kubegrab --remove <CONTEXT_NAME>
+
+Flags:
+  -h, --help            Show this help and exit.
+  --switch              Automatically switch to the imported context after import.
+  --remove <name>       Remove a context and its associated cluster + user from
+                        ~/.kube/config (a backup is created first).
+
+Positional arguments (all optional — missing values are prompted interactively):
+  SOURCE        Path to the source kubeconfig file, or "-" to force stdin.
+                When omitted and stdin is a pipe, stdin is used automatically.
+  CLUSTER_NAME  Name to register the cluster/context under (default: random UUID).
+  CLUSTER_USER  Credential entry name (default: <CLUSTER_NAME>-user).
+  SERVER_URL    Override the API server URL, e.g. https://192.168.1.10:6443.
+                Leave empty to keep the URL from the source config.
+  INSECURE      true/false — skip TLS certificate verification (default: false).
+
+Examples:
+  # Import from a local file, prompting for the rest:
+  kubegrab ./config.yaml
+
+  # Fully non-interactive:
+  kubegrab ./config.yaml prod prod-user https://10.0.0.5:6443 false
+
+  # One-liner remote import over SSH (the killer use-case):
+  ssh user@host -- cat .kube/config | kubegrab
+
+  # SSH import with explicit context name and auto-switch:
+  ssh user@host -- cat .kube/config | kubegrab --switch - staging
+
+  # Remove a context (backs up first):
+  kubegrab --remove staging
+
+Notes:
+  * If the source kubeconfig contains multiple clusters, you are prompted to
+    choose which one to import.
+  * If the target context name already exists you are asked to confirm overwrite.
+  * A compressed backup ~/.kube/config.<timestamp>.bak.gz is written before
+    every modification.
+  * Interactive prompts always read from /dev/tty, so they work correctly
+    even when stdin is a pipe.
+
+Requires: kubectl, base64, gzip, mktemp.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+gen_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [ -r /dev/urandom ]; then
+    od -An -tx1 -N16 /dev/urandom \
+      | tr -d ' \n' \
+      | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/'
+  else
+    # RFC 4122 v4 variant without external tools
+    printf '%08x-%04x-4%03x-%04x-%012x' \
+      $(( RANDOM * RANDOM )) $(( RANDOM & 0xFFFF )) $(( RANDOM & 0xFFF )) \
+      $(( (RANDOM & 0x3FFF) | 0x8000 )) $(( RANDOM * RANDOM * RANDOM ))
+  fi
+}
+
+# Read a prompt from /dev/tty so it works even when stdin is a pipe.
+read_tty() {
+  local prompt="$1" __var="$2" value=""
+  if [ -r /dev/tty ]; then
+    read -r -p "$prompt" value < /dev/tty
+  else
+    read -r -p "$prompt" value
+  fi
+  printf -v "$__var" '%s' "$value"
+}
+
+ask_with_default() {
+  local value=""
+  read_tty "$1 [$2]: " value
+  echo "${value:-$2}"
+}
+
+ask_yes_no() {
+  local value=""
+  read_tty "$1 [$2]: " value
+  value="${value:-$2}"
+  case "$value" in
+    y|Y|yes|YES|true|TRUE|1) echo "true" ;;
+    *) echo "false" ;;
+  esac
+}
+
+# Create a gzip backup of the destination config.
+backup_dest() {
+  local dest="$1"
+  if [ -s "$dest" ]; then
+    local bak="${dest}.$(date +%Y%m%d%H%M%S).bak.gz"
+    gzip -c "$dest" > "$bak"
+    chmod 600 "$bak"
+    echo "Backup created: $bak"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Flag parsing
+# ---------------------------------------------------------------------------
+
+AUTO_SWITCH=false
+REMOVE_CTX=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help|help) usage; exit 0 ;;
+    --switch)  AUTO_SWITCH=true; shift ;;
+    --remove)
+      [ -z "${2:-}" ] && { echo "Error: --remove requires a context name" >&2; exit 1; }
+      REMOVE_CTX="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "Error: unknown flag: $1" >&2; usage >&2; exit 1 ;;
+    *)  break ;;
+  esac
+done
+
+DEST_CONFIG="${HOME}/.kube/config"
+
+# ---------------------------------------------------------------------------
+# --remove subcommand
+# ---------------------------------------------------------------------------
+
+if [ -n "$REMOVE_CTX" ]; then
+  [ ! -f "$DEST_CONFIG" ] && { echo "Error: $DEST_CONFIG does not exist" >&2; exit 1; }
+
+  CTX_CLUSTER=$(kubectl --kubeconfig "$DEST_CONFIG" config view \
+    -o jsonpath="{.contexts[?(@.name==\"${REMOVE_CTX}\")].context.cluster}" 2>/dev/null)
+  CTX_USER=$(kubectl --kubeconfig "$DEST_CONFIG" config view \
+    -o jsonpath="{.contexts[?(@.name==\"${REMOVE_CTX}\")].context.user}" 2>/dev/null)
+
+  [ -z "$CTX_CLUSTER" ] && {
+    echo "Error: context '$REMOVE_CTX' not found in $DEST_CONFIG" >&2; exit 1
+  }
+
+  backup_dest "$DEST_CONFIG"
+  kubectl --kubeconfig "$DEST_CONFIG" config delete-context "$REMOVE_CTX"
+  kubectl --kubeconfig "$DEST_CONFIG" config delete-cluster "$CTX_CLUSTER" 2>/dev/null || true
+  kubectl --kubeconfig "$DEST_CONFIG" config delete-user   "$CTX_USER"    2>/dev/null || true
+  echo "Removed context '$REMOVE_CTX' (cluster: $CTX_CLUSTER, user: $CTX_USER)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Cleanup on exit
+# ---------------------------------------------------------------------------
+
+STDIN_TMP="" CA_FILE="" CERT_FILE="" KEY_FILE=""
+
+cleanup() {
+  rm -f "$STDIN_TMP" "$CA_FILE" "$CERT_FILE" "$KEY_FILE"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Source resolution
+# After flag parsing, remaining positionals are:
+#   $1=SOURCE  $2=CLUSTER_NAME  $3=CLUSTER_USER  $4=SERVER_URL  $5=INSECURE
+# We track consumed arg indices in array ARGS[] so stdin + flags mix cleanly.
+# ---------------------------------------------------------------------------
+
+ARGS=("$@")
+SRC_CONSUMED=0   # number of leading ARGS entries consumed by source detection
+
+if [ ${#ARGS[@]} -ge 1 ] && [ -n "${ARGS[0]:-}" ] && [ "${ARGS[0]}" != "-" ]; then
+  SRC_CONFIG="${ARGS[0]}"
+  SRC_CONSUMED=1
+elif { [ "${ARGS[0]:-}" = "-" ] || [ ${#ARGS[@]} -eq 0 ]; } && [ ! -t 0 ]; then
+  STDIN_TMP="$(mktemp)"
+  cat > "$STDIN_TMP"
+  [ ! -s "$STDIN_TMP" ] && { echo "Error: no data received on stdin" >&2; exit 1; }
+  SRC_CONFIG="$STDIN_TMP"
+  [ "${ARGS[0]:-}" = "-" ] && SRC_CONSUMED=1
+else
+  SRC_CONFIG="$(ask_with_default 'Source kubeconfig path' '/config.yaml')"
+fi
+
+[ ! -f "$SRC_CONFIG" ] && { echo "Error: source config not found: $SRC_CONFIG" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Multi-cluster source selection
+# ---------------------------------------------------------------------------
+
+mapfile -t SRC_CLUSTERS < <(
+  kubectl --kubeconfig "$SRC_CONFIG" config view \
+    -o jsonpath='{range .clusters[*]}{.name}{"\n"}{end}' 2>/dev/null
+)
+
+CLUSTER_COUNT="${#SRC_CLUSTERS[@]}"
+[ "$CLUSTER_COUNT" -eq 0 ] && { echo "Error: no clusters found in $SRC_CONFIG" >&2; exit 1; }
+
+if [ "$CLUSTER_COUNT" -eq 1 ]; then
+  CHOSEN_CLUSTER="${SRC_CLUSTERS[0]}"
+else
+  echo "Source kubeconfig contains $CLUSTER_COUNT clusters:"
+  for i in "${!SRC_CLUSTERS[@]}"; do
+    printf "  [%d] %s\n" "$((i+1))" "${SRC_CLUSTERS[$i]}"
+  done
+  read_tty "Select cluster [1]: " _idx_input
+  _idx="${_idx_input:-1}"
+  if ! [[ "$_idx" =~ ^[0-9]+$ ]] || [ "$_idx" -lt 1 ] || [ "$_idx" -gt "$CLUSTER_COUNT" ]; then
+    echo "Error: invalid selection '$_idx'" >&2; exit 1
+  fi
+  CHOSEN_CLUSTER="${SRC_CLUSTERS[$(( _idx - 1 ))]}"
+fi
+
+# Find the user associated with this cluster via its context.
+CHOSEN_SRC_USER=$(kubectl --kubeconfig "$SRC_CONFIG" config view \
+  -o jsonpath="{.contexts[?(@.context.cluster==\"${CHOSEN_CLUSTER}\")].context.user}" \
+  2>/dev/null | awk '{print $1}')
+
+# Fetch the original server URL now so it can be shown in the prompt below.
+ORIG_SERVER=$(kubectl --kubeconfig "$SRC_CONFIG" config view \
+  -o jsonpath="{.clusters[?(@.name==\"${CHOSEN_CLUSTER}\")].cluster.server}")
+
+# ---------------------------------------------------------------------------
+# Positional arg / prompt for metadata  (P = current positional index)
+# ---------------------------------------------------------------------------
+
+P=$SRC_CONSUMED
+
+if [ ${#ARGS[@]} -gt "$P" ] && [ -n "${ARGS[$P]:-}" ]; then
+  CLUSTER_NAME="${ARGS[$P]}"; (( P++ ))
+else
+  _cn_default="$(gen_uuid)"
+  read_tty "Cluster name [$_cn_default]: " _cn_input
+  CLUSTER_NAME="${_cn_input:-$_cn_default}"
+fi
+
+if [ ${#ARGS[@]} -gt "$P" ] && [ -n "${ARGS[$P]:-}" ]; then
+  CLUSTER_USER="${ARGS[$P]}"; (( P++ ))
+else
+  read_tty "Cluster user [${CLUSTER_NAME}-user]: " _cu_input
+  CLUSTER_USER="${_cu_input:-${CLUSTER_NAME}-user}"
+fi
+
+if [ ${#ARGS[@]} -gt "$P" ] && [ -n "${ARGS[$P]:-}" ]; then
+  SERVER_URL="${ARGS[$P]}"; (( P++ ))
+else
+  SERVER_URL="$(ask_with_default 'Server URL' "$ORIG_SERVER")"
+fi
+
+if [ ${#ARGS[@]} -gt "$P" ] && [ -n "${ARGS[$P]:-}" ]; then
+  case "${ARGS[$P]}" in
+    y|Y|yes|YES|true|TRUE|1) INSECURE=true ;;
+    *) INSECURE=false ;;
+  esac
+else
+  INSECURE="$(ask_yes_no 'Use insecure skip TLS verify?' 'false')"
+fi
+
+# ---------------------------------------------------------------------------
+# Ensure destination config exists
+# ---------------------------------------------------------------------------
+
+mkdir -p "$(dirname "$DEST_CONFIG")"
+if [ ! -f "$DEST_CONFIG" ]; then
+  printf 'apiVersion: v1\nclusters: []\ncontexts: []\ncurrent-context: ""\nkind: Config\npreferences: {}\nusers: []\n' \
+    > "$DEST_CONFIG"
+  chmod 600 "$DEST_CONFIG"
+fi
+
+# ---------------------------------------------------------------------------
+# Duplicate context check
+# ---------------------------------------------------------------------------
+
+EXISTING=$(kubectl --kubeconfig "$DEST_CONFIG" config view \
+  -o jsonpath="{.contexts[?(@.name==\"${CLUSTER_NAME}\")].name}" 2>/dev/null)
+
+if [ -n "$EXISTING" ]; then
+  echo "Warning: context '$CLUSTER_NAME' already exists in $DEST_CONFIG"
+  _ow="$(ask_yes_no 'Overwrite?' 'false')"
+  [ "$_ow" != "true" ] && { echo "Aborted."; exit 0; }
+fi
+
+# ---------------------------------------------------------------------------
+# Backup before any modification
+# ---------------------------------------------------------------------------
+
+backup_dest "$DEST_CONFIG"
+
+# ---------------------------------------------------------------------------
+# Extract certs from source by cluster/user name (not fragile index)
+# ---------------------------------------------------------------------------
+
+CA_FILE=$(mktemp); CERT_FILE=$(mktemp); KEY_FILE=$(mktemp)
+
+kubectl --kubeconfig "$SRC_CONFIG" config view --raw \
+  -o jsonpath="{.clusters[?(@.name==\"${CHOSEN_CLUSTER}\")].cluster.certificate-authority-data}" \
+  | base64 -d > "$CA_FILE"
+
+kubectl --kubeconfig "$SRC_CONFIG" config view --raw \
+  -o jsonpath="{.users[?(@.name==\"${CHOSEN_SRC_USER}\")].user.client-certificate-data}" \
+  | base64 -d > "$CERT_FILE"
+
+kubectl --kubeconfig "$SRC_CONFIG" config view --raw \
+  -o jsonpath="{.users[?(@.name==\"${CHOSEN_SRC_USER}\")].user.client-key-data}" \
+  | base64 -d > "$KEY_FILE"
+
+FINAL_SERVER="${SERVER_URL:-$ORIG_SERVER}"
+
+# ---------------------------------------------------------------------------
+# Inject into destination
+# ---------------------------------------------------------------------------
+
+kubectl --kubeconfig "$DEST_CONFIG" config set-cluster "$CLUSTER_NAME" \
+  --server="$FINAL_SERVER" \
+  --certificate-authority="$CA_FILE" \
+  --embed-certs=true
+
+[ "$INSECURE" = "true" ] && \
+  kubectl --kubeconfig "$DEST_CONFIG" config set-cluster "$CLUSTER_NAME" \
+    --insecure-skip-tls-verify=true
+
+kubectl --kubeconfig "$DEST_CONFIG" config set-credentials "$CLUSTER_USER" \
+  --client-certificate="$CERT_FILE" \
+  --client-key="$KEY_FILE" \
+  --embed-certs=true
+
+kubectl --kubeconfig "$DEST_CONFIG" config set-context "$CLUSTER_NAME" \
+  --cluster="$CLUSTER_NAME" \
+  --user="$CLUSTER_USER"
+
+echo "Imported '$CLUSTER_NAME' into $DEST_CONFIG"
+
+# ---------------------------------------------------------------------------
+# Optional auto-switch
+# ---------------------------------------------------------------------------
+
+if [ "$AUTO_SWITCH" = "true" ]; then
+  kubectl --kubeconfig "$DEST_CONFIG" config use-context "$CLUSTER_NAME"
+  echo "Switched to context '$CLUSTER_NAME'"
+else
+  echo "Switch to it with: kubectl config use-context $CLUSTER_NAME"
+fi
