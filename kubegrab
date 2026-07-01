@@ -132,6 +132,7 @@ while [ $# -gt 0 ]; do
       [ -z "${2:-}" ] && { echo "Error: --remove requires a context name" >&2; exit 1; }
       REMOVE_CTX="$2"; shift 2 ;;
     --) shift; break ;;
+    -)  break ;;   # bare '-' means stdin; leave it for positional handling
     -*) echo "Error: unknown flag: $1" >&2; usage >&2; exit 1 ;;
     *)  break ;;
   esac
