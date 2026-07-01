@@ -352,7 +352,6 @@ echo "Imported '$CLUSTER_NAME' into $DEST_CONFIG"
 
 if [ "$AUTO_SWITCH" = "true" ]; then
   kubectl --kubeconfig "$DEST_CONFIG" config use-context "$CLUSTER_NAME"
-  echo "Switched to context '$CLUSTER_NAME'"
 else
   echo "Switch to it with: kubectl config use-context $CLUSTER_NAME"
 fi
